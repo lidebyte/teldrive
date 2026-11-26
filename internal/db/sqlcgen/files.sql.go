@@ -751,9 +751,16 @@ WHERE files.user_id = $1
   )
   AND (
     $6::text IS NULL
-    OR (name COLLATE /* TEMPLATE: schema */natural_name, id) > ($6::text COLLATE /* TEMPLATE: schema */natural_name, $7::uuid)
+    OR (
+      (kind <> 'folder', name COLLATE /* TEMPLATE: schema */natural_name, id) >
+      (
+        (SELECT cursor.kind <> 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = $7::uuid AND cursor.user_id = $1),
+        $6::text COLLATE /* TEMPLATE: schema */natural_name,
+        $7::uuid
+      )
+    )
   )
-ORDER BY name COLLATE /* TEMPLATE: schema */natural_name, id
+ORDER BY (kind <> 'folder'), name COLLATE /* TEMPLATE: schema */natural_name, id
 LIMIT $8
 `
 
@@ -918,38 +925,55 @@ WHERE f.user_id = $1
   AND (
     $12::uuid IS NULL
     OR (
+      (SELECT cursor.kind = 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = $12::uuid AND cursor.user_id = $1)
+      AND (
+        f.kind <> 'folder'
+        OR (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) >
+          (SELECT cursor.name COLLATE /* TEMPLATE: schema */natural_name, cursor.id FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = $12::uuid AND cursor.user_id = $1)
+      )
+    )
+    OR (
+      f.kind <> 'folder'
+      AND (SELECT cursor.kind <> 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = $12::uuid AND cursor.user_id = $1)
+      AND (
+        (
       $13::text = 'name'
       AND $14::text IS NOT NULL
       AND (
         ($15::text = 'asc' AND (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) > ($14::text COLLATE /* TEMPLATE: schema */natural_name, $12::uuid))
         OR ($15::text = 'desc' AND (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) < ($14::text COLLATE /* TEMPLATE: schema */natural_name, $12::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       $13::text = 'updatedAt'
       AND $16::timestamptz IS NOT NULL
       AND (
         ($15::text = 'asc' AND (f.updated_at, f.id) > ($16::timestamptz, $12::uuid))
         OR ($15::text = 'desc' AND (f.updated_at, f.id) < ($16::timestamptz, $12::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       $13::text = 'size'
       AND $17::bigint IS NOT NULL
       AND (
         ($15::text = 'asc' AND (COALESCE(f.size, -1), f.id) > ($17::bigint, $12::uuid))
         OR ($15::text = 'desc' AND (COALESCE(f.size, -1), f.id) < ($17::bigint, $12::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       $13::text = 'id'
       AND (
         ($15::text = 'asc' AND f.id > $12::uuid)
         OR ($15::text = 'desc' AND f.id < $12::uuid)
       )
+        )
+      )
     )
   )
 ORDER BY
+  (f.kind <> 'folder'),
+  CASE WHEN f.kind = 'folder' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name ASC,
+  CASE WHEN f.kind = 'folder' THEN f.id END ASC,
   CASE WHEN $13::text = 'name' AND $15::text = 'asc' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name ASC,
   CASE WHEN $13::text = 'name' AND $15::text = 'desc' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name DESC,
   CASE WHEN $13::text = 'updatedAt' AND $15::text = 'asc' THEN f.updated_at END ASC,

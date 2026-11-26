@@ -22,7 +22,7 @@ func TestNaturalNameSortingAndPagination(t *testing.T) {
 	svc := catalog.NewService(db.Pool, nil)
 
 	// Include multiple digit runs, leading zeros, Unicode, and numbers too large
-	// for a bigint. Alternate files and folders: both use the same name order.
+	// for a bigint. Alternate files and folders to exercise folder-first ordering.
 	want := []string{
 		"entry1.txt", "entry02.txt", "entry2.txt", "entry3.txt",
 		"entry10.txt", "entry11.txt", "entry20.txt",
@@ -49,19 +49,46 @@ VALUES ($1,1001,$2,$3,$4,'active',now())`, uuid.New(), want[i], kind, size); err
 	}
 
 	for _, tc := range []struct {
-		name, order, searchType string
+		name, order, searchType, sort string
 	}{
-		{"basic", "asc", "text"},
-		{"advanced_ascending", "asc", "regex"},
-		{"advanced_descending", "desc", "regex"},
+		{"basic", "asc", "text", "name"},
+		{"advanced_ascending", "asc", "regex", "name"},
+		{"advanced_descending", "desc", "regex", "name"},
+		{"size_ascending", "asc", "regex", "size"},
+		{"size_descending", "desc", "regex", "size"},
+		{"updated_ascending", "asc", "regex", "updatedAt"},
+		{"updated_descending", "desc", "regex", "updatedAt"},
+		{"id_ascending", "asc", "regex", "id"},
+		{"id_descending", "desc", "regex", "id"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			expected := slices.Clone(want)
-			if tc.order == "desc" {
-				slices.Reverse(expected)
+			var expected, files []string
+			for i, name := range want {
+				if i%2 == 0 {
+					expected = append(expected, name)
+				} else {
+					files = append(files, name)
+				}
 			}
+			// Obtain the file-only order separately: folder grouping must not
+			// change the selected ordering within files.
+			if tc.sort != "name" {
+				kind := sqlcgen.FileKindFile
+				rows, err := svc.List(ctx, catalog.ListInput{UserID: 1001, Kind: &kind, Sort: tc.sort, Order: "asc", Limit: 100})
+				if err != nil {
+					t.Fatal(err)
+				}
+				files = nil
+				for _, row := range rows {
+					files = append(files, row.Name)
+				}
+			}
+			if tc.order == "desc" {
+				slices.Reverse(files)
+			}
+			expected = append(expected, files...)
 			for _, pageSize := range []int32{1, 3, 100} {
-				input := catalog.ListInput{UserID: 1001, Sort: "name", Order: tc.order, SearchType: tc.searchType, Limit: pageSize}
+				input := catalog.ListInput{UserID: 1001, Sort: tc.sort, Order: tc.order, SearchType: tc.searchType, Limit: pageSize}
 				var got []string
 				for {
 					page, err := svc.List(ctx, input)
@@ -81,7 +108,7 @@ VALUES ($1,1001,$2,$3,$4,'active',now())`, uuid.New(), want[i], kind, size); err
 					id := uuid.UUID(last.ID.Bytes)
 					input.AfterID, input.AfterName = &id, last.Name
 					if tc.searchType == "regex" {
-						input.AfterValue = catalog.FileCursorValue(last, "name")
+						input.AfterValue = catalog.FileCursorValue(last, tc.sort)
 					}
 				}
 				if !slices.Equal(got, expected) {

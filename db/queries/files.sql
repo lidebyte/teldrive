@@ -79,9 +79,16 @@ WHERE files.user_id = sqlc.arg(user_id)
   )
   AND (
     sqlc.narg(after_name)::text IS NULL
-    OR (name COLLATE /* TEMPLATE: schema */natural_name, id) > (sqlc.narg(after_name)::text COLLATE /* TEMPLATE: schema */natural_name, sqlc.narg(after_id)::uuid)
+    OR (
+      (kind <> 'folder', name COLLATE /* TEMPLATE: schema */natural_name, id) >
+      (
+        (SELECT cursor.kind <> 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = sqlc.narg(after_id)::uuid AND cursor.user_id = sqlc.arg(user_id)),
+        sqlc.narg(after_name)::text COLLATE /* TEMPLATE: schema */natural_name,
+        sqlc.narg(after_id)::uuid
+      )
+    )
   )
-ORDER BY name COLLATE /* TEMPLATE: schema */natural_name, id
+ORDER BY (kind <> 'folder'), name COLLATE /* TEMPLATE: schema */natural_name, id
 LIMIT sqlc.arg(page_size);
 
 -- name: CreateFolder :one
@@ -342,38 +349,55 @@ WHERE f.user_id = sqlc.arg(user_id)
   AND (
     sqlc.narg(after_id)::uuid IS NULL
     OR (
+      (SELECT cursor.kind = 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = sqlc.narg(after_id)::uuid AND cursor.user_id = sqlc.arg(user_id))
+      AND (
+        f.kind <> 'folder'
+        OR (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) >
+          (SELECT cursor.name COLLATE /* TEMPLATE: schema */natural_name, cursor.id FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = sqlc.narg(after_id)::uuid AND cursor.user_id = sqlc.arg(user_id))
+      )
+    )
+    OR (
+      f.kind <> 'folder'
+      AND (SELECT cursor.kind <> 'folder' FROM /* TEMPLATE: schema */files cursor WHERE cursor.id = sqlc.narg(after_id)::uuid AND cursor.user_id = sqlc.arg(user_id))
+      AND (
+        (
       sqlc.arg(sort_by)::text = 'name'
       AND sqlc.narg(after_name)::text IS NOT NULL
       AND (
         (sqlc.arg(sort_order)::text = 'asc' AND (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) > (sqlc.narg(after_name)::text COLLATE /* TEMPLATE: schema */natural_name, sqlc.narg(after_id)::uuid))
         OR (sqlc.arg(sort_order)::text = 'desc' AND (f.name COLLATE /* TEMPLATE: schema */natural_name, f.id) < (sqlc.narg(after_name)::text COLLATE /* TEMPLATE: schema */natural_name, sqlc.narg(after_id)::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       sqlc.arg(sort_by)::text = 'updatedAt'
       AND sqlc.narg(after_updated_at)::timestamptz IS NOT NULL
       AND (
         (sqlc.arg(sort_order)::text = 'asc' AND (f.updated_at, f.id) > (sqlc.narg(after_updated_at)::timestamptz, sqlc.narg(after_id)::uuid))
         OR (sqlc.arg(sort_order)::text = 'desc' AND (f.updated_at, f.id) < (sqlc.narg(after_updated_at)::timestamptz, sqlc.narg(after_id)::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       sqlc.arg(sort_by)::text = 'size'
       AND sqlc.narg(after_size)::bigint IS NOT NULL
       AND (
         (sqlc.arg(sort_order)::text = 'asc' AND (COALESCE(f.size, -1), f.id) > (sqlc.narg(after_size)::bigint, sqlc.narg(after_id)::uuid))
         OR (sqlc.arg(sort_order)::text = 'desc' AND (COALESCE(f.size, -1), f.id) < (sqlc.narg(after_size)::bigint, sqlc.narg(after_id)::uuid))
       )
-    )
-    OR (
+        )
+        OR (
       sqlc.arg(sort_by)::text = 'id'
       AND (
         (sqlc.arg(sort_order)::text = 'asc' AND f.id > sqlc.narg(after_id)::uuid)
         OR (sqlc.arg(sort_order)::text = 'desc' AND f.id < sqlc.narg(after_id)::uuid)
       )
+        )
+      )
     )
   )
 ORDER BY
+  (f.kind <> 'folder'),
+  CASE WHEN f.kind = 'folder' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name ASC,
+  CASE WHEN f.kind = 'folder' THEN f.id END ASC,
   CASE WHEN sqlc.arg(sort_by)::text = 'name' AND sqlc.arg(sort_order)::text = 'asc' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name ASC,
   CASE WHEN sqlc.arg(sort_by)::text = 'name' AND sqlc.arg(sort_order)::text = 'desc' THEN f.name END COLLATE /* TEMPLATE: schema */natural_name DESC,
   CASE WHEN sqlc.arg(sort_by)::text = 'updatedAt' AND sqlc.arg(sort_order)::text = 'asc' THEN f.updated_at END ASC,
