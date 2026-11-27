@@ -21,6 +21,7 @@ import (
 
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/channels"
+	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
@@ -71,6 +72,64 @@ func TestUploadSourceWorkerPublishesAndSkipsMatchingLocalFile(t *testing.T) {
 	}
 	if mimeType != "text/plain" {
 		t.Fatalf("published MIME type = %q, want text/plain", mimeType)
+	}
+}
+
+func TestUploadSourceWorkerDiscoversStoredUploadWithoutReadingSource(t *testing.T) {
+	for _, hasModTime := range []bool{true, false} {
+		t.Run(fmt.Sprintf("hasModTime=%t", hasModTime), func(t *testing.T) {
+			db := testpostgres.New(t)
+			ctx := context.Background()
+			seedCleanupOwner(t, db.Pool)
+			payload := []byte("already stored upload")
+			modTime := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+			mimeType := "text/plain"
+			storage := &uploadWorkerStorage{}
+			uploadService := uploads.NewService(db.Pool)
+			catalogService := catalog.NewService(db.Pool, nil)
+			channelService := channels.NewService(db.Pool, channels.TelegramCreator{Storage: storage}, channels.Config{PartLimit: 1000})
+			pipeline := transfer.NewPipeline(uploadService, channelService, storage, nil, transfer.Config{})
+			session, err := uploadService.Create(ctx, uploads.CreateInput{
+				UserID: 1001, Name: "resume.txt", ExpectedSize: int64(len(payload)),
+				MIMEType: &mimeType, ModTime: modTime, ConflictPolicy: sqlcgen.NameConflictPolicyReplace,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			uploadID := uuid.UUID(session.ID.Bytes)
+			if _, err := pipeline.UploadPart(ctx, transfer.UploadPartRequest{
+				UserID: 1001, UploadID: uploadID, PartNo: 1,
+				PlainSize: int64(len(payload)), Body: bytes.NewReader(payload),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("stored parts must be reused without reading or checksumming the source")
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			worker := jobs.NewUploadSourceWorker(db.Pool, catalogService, uploadService, pipeline, server.Client(), 0, false)
+			source := jobs.UploadFileSource{
+				Type: "http", Location: server.URL + "/resume.txt", DestinationPath: "resume.txt",
+				Size: int64(len(payload)), MIMEType: mimeType, HasModTime: hasModTime,
+			}
+			if hasModTime {
+				source.ModTime = modTime
+			}
+			// No upload ID is supplied: discover the existing session by metadata.
+			if err := worker.Work(ctx, &river.Job[jobs.UploadSourceArgs]{Args: jobs.UploadSourceArgs{
+				BatchID: uuid.NewString(), UserID: 1001, Source: source,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			var state string
+			if err := db.Pool.QueryRow(ctx, `SELECT state FROM upload_sessions WHERE id=$1`, uploadID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != "completed" || storage.uploads != 1 {
+				t.Fatalf("session state=%s, Telegram uploads=%d; want completed and 1", state, storage.uploads)
+			}
+		})
 	}
 }
 

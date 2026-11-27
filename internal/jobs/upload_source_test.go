@@ -33,8 +33,21 @@ func TestUploadSourceWorkerDetectsMIME(t *testing.T) {
 		}))
 		defer server.Close()
 		worker := NewUploadSourceWorker(nil, nil, nil, nil, server.Client(), 0, false)
-		got, err := worker.detectSourceMIME(context.Background(), UploadFileSource{Type: "http", Location: server.URL, DestinationPath: "file.bin", MIMEType: "application/octet-stream"})
+		got, err := worker.detectSourceMIME(context.Background(), UploadFileSource{Type: "http", Location: server.URL, Size: 18, DestinationPath: "file.bin", MIMEType: "application/octet-stream"})
 		if err != nil || got != "text/plain" {
+			t.Fatalf("detectSourceMIME() = %q, %v", got, err)
+		}
+	})
+
+	t.Run("empty HTTP source does not request a range", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Error("empty source should not be read for MIME detection")
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		}))
+		defer server.Close()
+		worker := NewUploadSourceWorker(nil, nil, nil, nil, server.Client(), 0, false)
+		got, err := worker.detectSourceMIME(context.Background(), UploadFileSource{Type: "http", Location: server.URL, DestinationPath: "empty.bin"})
+		if err != nil || got != "application/octet-stream" {
 			t.Fatalf("detectSourceMIME() = %q, %v", got, err)
 		}
 	})
@@ -107,6 +120,9 @@ func TestExpandLocalSourceRecursesAndFilters(t *testing.T) {
 func TestInspectHTTPSourceMergesHeadersAndMetadata(t *testing.T) {
 	modified := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.Header.Get("Range") != "bytes=0-0" {
+			t.Errorf("request = %s, Range %q", request.Method, request.Header.Get("Range"))
+		}
 		if request.Header.Get("Authorization") != "Bearer source" || request.Header.Get("Referer") != "https://batch.example/" {
 			t.Errorf("headers = %#v", request.Header)
 		}
@@ -123,6 +139,69 @@ func TestInspectHTTPSourceMergesHeadersAndMetadata(t *testing.T) {
 	}
 	if file.DestinationPath != "remote.bin" || file.Size != 42 || !file.HasModTime || !file.ModTime.Equal(modified) {
 		t.Fatalf("HTTP source = %#v", file)
+	}
+}
+
+func TestInspectHTTPSourceRangeResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name, contentRange, contentLength string
+		status                            int
+		wantSize                          int64
+		wantError                         bool
+	}{
+		{name: "HEAD rejected but range GET supported", status: 206, contentRange: "bytes 0-0/11427624", contentLength: "1", wantSize: 11427624},
+		{name: "range ignored", status: 200, contentLength: "42", wantSize: 42},
+		{name: "empty file", status: 416, contentRange: "bytes */0", wantSize: 0},
+		{name: "missing range", status: 206, contentLength: "1", wantError: true},
+		{name: "unknown total", status: 206, contentRange: "bytes 0-0/*", wantError: true},
+		{name: "invalid total", status: 206, contentRange: "bytes 0-0/no", wantError: true},
+		{name: "overflow total", status: 206, contentRange: "bytes 0-0/9223372036854775808", wantError: true},
+		{name: "zero total", status: 206, contentRange: "bytes 0-0/0", wantError: true},
+		{name: "negative total", status: 206, contentRange: "bytes 0-0/-1", wantError: true},
+		{name: "wrong offset", status: 206, contentRange: "bytes 1-1/42", wantError: true},
+		{name: "wrong end", status: 206, contentRange: "bytes 0-1/42", wantError: true},
+		{name: "wrong length", status: 206, contentRange: "bytes 0-0/42", contentLength: "2", wantError: true},
+		{name: "unknown length", status: 200, wantError: true},
+		{name: "not found", status: 404, wantError: true},
+		{name: "unauthorized", status: 401, wantError: true},
+		{name: "unexpected success", status: 204, wantError: true},
+		{name: "unsatisfied nonempty range", status: 416, contentRange: "bytes */42", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodGet || r.Header.Get("Range") != "bytes=0-0" {
+					t.Errorf("request = %s, Range %q", r.Method, r.Header.Get("Range"))
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Range", tc.contentRange)
+				if tc.contentLength != "" {
+					w.Header().Set("Content-Length", tc.contentLength)
+				}
+				w.WriteHeader(tc.status)
+				// Flush headers without a body so missing Content-Length stays
+				// unknown and inspection must not wait to download the content.
+				w.(http.Flusher).Flush()
+				if tc.status != http.StatusNoContent {
+					<-r.Context().Done()
+				}
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			file, err := inspectHTTPSource(ctx, server.Client(), UploadSource{URL: server.URL + "/file.bin"}, nil)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("inspectHTTPSource() error = %v, want error %v", err, tc.wantError)
+			}
+			if err == nil && file.Size != tc.wantSize {
+				t.Fatalf("size = %d, want %d", file.Size, tc.wantSize)
+			}
+			if requests != 1 {
+				t.Fatalf("requests = %d, want 1", requests)
+			}
+		})
 	}
 }
 

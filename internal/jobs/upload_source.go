@@ -629,6 +629,11 @@ func (w *UploadSourceWorker) detectSourceMIME(ctx context.Context, source Upload
 		}
 		reader = file
 	case "http":
+		if source.Size == 0 {
+			// Empty sources cannot satisfy a byte range. Fall back to
+			// the destination extension without requesting their body.
+			break
+		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.Location, nil)
 		if err != nil {
 			return "", fmt.Errorf("create MIME detection request: %w", err)
@@ -647,10 +652,13 @@ func (w *UploadSourceWorker) detectSourceMIME(ctx context.Context, source Upload
 	default:
 		return "", fmt.Errorf("%w: unsupported source type %q", errInvalidUploadSource, source.Type)
 	}
-	defer reader.Close()
-
 	buffer := make([]byte, 512)
-	read, err := io.ReadFull(reader, buffer)
+	var read int
+	var err error
+	if reader != nil {
+		defer reader.Close()
+		read, err = io.ReadFull(reader, buffer)
+	}
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", fmt.Errorf("read source for MIME detection: %w", err)
 	}
@@ -931,37 +939,35 @@ func inspectHTTPSource(ctx context.Context, client *http.Client, source UploadSo
 		return UploadFileSource{}, fmt.Errorf("%w: invalid HTTP URL", errInvalidUploadSource)
 	}
 	headers := mergeUploadHeaders(defaults, source.Headers)
-	request, err := http.NewRequestWithContext(ctx, http.MethodHead, parsed.String(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return UploadFileSource{}, err
 	}
 	applyUploadHeaders(request.Header, headers)
+	request.Header.Set("Range", "bytes=0-0")
 	response, err := client.Do(request)
 	if err != nil {
 		return UploadFileSource{}, errors.New("inspect HTTP upload source request failed")
 	}
 	_ = response.Body.Close()
-	if response.StatusCode == http.StatusMethodNotAllowed || response.StatusCode == http.StatusNotImplemented {
-		request, err = http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
-		if err != nil {
-			return UploadFileSource{}, err
-		}
-		applyUploadHeaders(request.Header, headers)
-		request.Header.Set("Range", "bytes=0-0")
-		response, err = client.Do(request)
-		if err != nil {
-			return UploadFileSource{}, errors.New("inspect HTTP upload source request failed")
-		}
-		_ = response.Body.Close()
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return UploadFileSource{}, fmt.Errorf("inspect HTTP upload source: %s", response.Status)
-	}
 	size := response.ContentLength
-	if contentRange := response.Header.Get("Content-Range"); contentRange != "" {
-		if slash := strings.LastIndex(contentRange, "/"); slash >= 0 {
-			size, _ = strconv.ParseInt(contentRange[slash+1:], 10, 64)
+	switch response.StatusCode {
+	case http.StatusOK:
+		// The server ignored Range; Content-Length describes the whole file.
+	case http.StatusPartialContent:
+		total, ok := strings.CutPrefix(response.Header.Get("Content-Range"), "bytes 0-0/")
+		size, err = strconv.ParseInt(total, 10, 64)
+		if !ok || err != nil || size <= 0 || (response.ContentLength >= 0 && response.ContentLength != 1) {
+			return UploadFileSource{}, fmt.Errorf("%w: invalid HTTP source content range", errInvalidUploadSource)
 		}
+	case http.StatusRequestedRangeNotSatisfiable:
+		// A zero-byte file cannot satisfy bytes=0-0.
+		if response.Header.Get("Content-Range") != "bytes */0" {
+			return UploadFileSource{}, fmt.Errorf("inspect HTTP upload source: %s", response.Status)
+		}
+		size = 0
+	default:
+		return UploadFileSource{}, fmt.Errorf("inspect HTTP upload source: %s", response.Status)
 	}
 	if size < 0 {
 		return UploadFileSource{}, fmt.Errorf("%w: HTTP source has no content length", errInvalidUploadSource)
